@@ -194,55 +194,84 @@ public sealed unsafe class FfmpegEncoder : IDisposable
             _width = width & ~1u;
             _height = height & ~1u;
 
+            ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Initializing: {width}x{height} @ {_fps}fps");
+
+            // Try GPU-accelerated encoders: NVENC (NVIDIA) > AMF (AMD) > QSV (Intel)
             bool useHevc = width > 4096 || height > 4096;
-            string codecName = useHevc ? "hevc_nvenc" : "h264_nvenc";
+            string[] encoders = useHevc
+                ? new[] { "hevc_nvenc", "hevc_amf", "hevc_qsv" }
+                : new[] { "h264_nvenc", "h264_amf", "h264_qsv" };
 
-            ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Initializing: {width}x{height} {codecName} @ {_fps}fps");
+            AVCodec* codec = null;
+            string codecName = null;
+            int ret = -1;
 
-            // Find NVENC encoder
-            var codec = ffmpeg.avcodec_find_encoder_by_name(codecName);
-            if (codec == null)
+            foreach (var name in encoders)
             {
-                ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] {codecName} not found, trying software h264");
-                codec = ffmpeg.avcodec_find_encoder(AVCodecID.AV_CODEC_ID_H264);
+                codec = ffmpeg.avcodec_find_encoder_by_name(name);
+                if (codec == null) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] {name} not available"); continue; }
+
+                ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Trying {name}...");
+
+                // Clean up previous failed attempt
+                if (_codecCtx != null) { var c = _codecCtx; ffmpeg.avcodec_free_context(&c); _codecCtx = null; }
+                if (_hwFramesCtx != null) { var h = _hwFramesCtx; ffmpeg.av_buffer_unref(&h); _hwFramesCtx = null; }
+                if (_hwDeviceCtx != null) { var h = _hwDeviceCtx; ffmpeg.av_buffer_unref(&h); _hwDeviceCtx = null; }
+
+                _codecCtx = ffmpeg.avcodec_alloc_context3(codec);
+                if (_codecCtx == null) continue;
+
+                _codecCtx->width = (int)_width;
+                _codecCtx->height = (int)_height;
+                _codecCtx->time_base = new AVRational { num = 1, den = (int)_fps };
+                _codecCtx->framerate = new AVRational { num = (int)_fps, den = 1 };
+                _codecCtx->gop_size = (int)_fps;
+                _codecCtx->max_b_frames = 0;
+                _codecCtx->pix_fmt = AVPixelFormat.AV_PIX_FMT_D3D11;
+                _codecCtx->flags |= ffmpeg.AV_CODEC_FLAG_LOW_DELAY | ffmpeg.AV_CODEC_FLAG_GLOBAL_HEADER;
+                _codecCtx->bit_rate = 8_000_000;
+                _codecCtx->rc_max_rate = 12_000_000;
+                _codecCtx->rc_buffer_size = 8_000_000;
+
+                SetupHardwareContext(d3dDevice);
+
+                AVDictionary* opts = null;
+                if (name.Contains("nvenc"))
+                {
+                    ffmpeg.av_dict_set(&opts, "preset", "p1", 0);
+                    ffmpeg.av_dict_set(&opts, "tune", "ull", 0);
+                    ffmpeg.av_dict_set(&opts, "rc", "vbr", 0);
+                    ffmpeg.av_dict_set(&opts, "zerolatency", "1", 0);
+                    ffmpeg.av_dict_set(&opts, "delay", "0", 0);
+                    ffmpeg.av_dict_set(&opts, "rc-lookahead", "0", 0);
+                }
+                else if (name.Contains("amf"))
+                {
+                    ffmpeg.av_dict_set(&opts, "usage", "ultralowlatency", 0);
+                    ffmpeg.av_dict_set(&opts, "quality", "speed", 0);
+                    ffmpeg.av_dict_set(&opts, "rc", "vbr_latency", 0);
+                }
+                else if (name.Contains("qsv"))
+                {
+                    ffmpeg.av_dict_set(&opts, "preset", "veryfast", 0);
+                    ffmpeg.av_dict_set(&opts, "low_power", "1", 0);
+                }
+
+                lock (_d3dContextLock)
+                {
+                    ret = ffmpeg.avcodec_open2(_codecCtx, codec, &opts);
+                }
+                ffmpeg.av_dict_free(&opts);
+
+                if (ret >= 0) { codecName = name; break; }
+                ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] {name} failed: {FfmpegError(ret)}");
             }
-            if (codec == null) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] No H.264 encoder found"); _initFailed = true; return false; }
 
-            _codecCtx = ffmpeg.avcodec_alloc_context3(codec);
-            if (_codecCtx == null) { _initFailed = true; return false; }
-
-            // Configure encoder — optimized for low-latency desktop streaming
-            _codecCtx->width = (int)_width;
-            _codecCtx->height = (int)_height;
-            _codecCtx->time_base = new AVRational { num = 1, den = (int)_fps };
-            _codecCtx->framerate = new AVRational { num = (int)_fps, den = 1 };
-            _codecCtx->gop_size = (int)_fps; // Keyframe every 1s
-            _codecCtx->max_b_frames = 0; // No B-frames — critical for low latency
-            _codecCtx->pix_fmt = AVPixelFormat.AV_PIX_FMT_D3D11;
-            _codecCtx->flags |= ffmpeg.AV_CODEC_FLAG_LOW_DELAY | ffmpeg.AV_CODEC_FLAG_GLOBAL_HEADER;
-            _codecCtx->bit_rate = 8_000_000; // 8 Mbps target — good for 1080p motion
-            _codecCtx->rc_max_rate = 12_000_000; // 12 Mbps ceiling for burst scenes
-            _codecCtx->rc_buffer_size = 8_000_000; // 1s buffer at target rate
-
-            // Set up D3D11 hardware device context using our existing device
-            SetupHardwareContext(d3dDevice);
-
-            // NVENC options — p1 is fastest encode, ull = ultra low latency
-            AVDictionary* opts = null;
-            ffmpeg.av_dict_set(&opts, "preset", "p1", 0); // Fastest encode
-            ffmpeg.av_dict_set(&opts, "tune", "ull", 0); // Ultra low latency
-            ffmpeg.av_dict_set(&opts, "rc", "vbr", 0); // Variable bitrate — auto adapts to motion
-            ffmpeg.av_dict_set(&opts, "zerolatency", "1", 0);
-            ffmpeg.av_dict_set(&opts, "delay", "0", 0); // No encode delay
-            ffmpeg.av_dict_set(&opts, "rc-lookahead", "0", 0); // No lookahead — encode immediately
-
-            int ret;
-            lock (_d3dContextLock)
+            if (ret < 0 || codecName == null)
             {
-                ret = ffmpeg.avcodec_open2(_codecCtx, codec, &opts);
+                ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] No GPU encoder available (need NVIDIA, AMD, or Intel GPU)");
+                _initFailed = true; return false;
             }
-            ffmpeg.av_dict_free(&opts);
-            if (ret < 0) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] avcodec_open2 failed: {FfmpegError(ret)}"); _initFailed = true; return false; }
 
             ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] Codec opened: {codecName}");
 
@@ -516,9 +545,8 @@ public sealed unsafe class FfmpegEncoder : IDisposable
     private void EncodeFrameInternal(IntPtr srcTexture, uint width, uint height)
     {
         int ret;
+        AVFrame* frameToEncode;
 
-        // Lock the D3D11 immediate context — OnFrameArrived on the WGC callback thread
-        // uses the same context. D3D11 contexts are NOT thread-safe.
         lock (_d3dContextLock)
         {
             using (DesktopBuddyMod.Perf.Time("ffmpeg_get_buffer"))
@@ -527,29 +555,29 @@ public sealed unsafe class FfmpegEncoder : IDisposable
                 if (ret < 0) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] av_hwframe_get_buffer failed: {FfmpegError(ret)}"); return; }
             }
 
-            // Copy our D3D11 texture to the frame's D3D11 texture
             using (DesktopBuddyMod.Perf.Time("ffmpeg_tex_copy"))
             {
                 IntPtr dstTexture = (IntPtr)_hwFrame->data[0];
                 int dstIndex = (int)_hwFrame->data[1];
                 CopyTextureToFrame(_deviceContext, dstTexture, dstIndex, srcTexture, (int)_width, (int)_height);
             }
-        } // release D3D context lock before NVENC encode (NVENC has its own hardware unit)
+        }
+        frameToEncode = _hwFrame;
 
         // Wall clock pts — monotonically increasing, never duplicate
         double elapsedSec = (double)(System.Diagnostics.Stopwatch.GetTimestamp() - _startTicks) / System.Diagnostics.Stopwatch.Frequency;
         long videoPts = (long)(elapsedSec * _fps);
         if (videoPts <= _lastVideoPts) videoPts = _lastVideoPts + 1;
         _lastVideoPts = videoPts;
-        _hwFrame->pts = videoPts;
-        _hwFrame->width = (int)_width;
-        _hwFrame->height = (int)_height;
+        frameToEncode->pts = videoPts;
+        frameToEncode->width = (int)_width;
+        frameToEncode->height = (int)_height;
 
-        // Encode (GPU — NVENC handles keyframes via gop_size=15)
+        // Encode
         using (DesktopBuddyMod.Perf.Time("ffmpeg_encode"))
         {
-            ret = ffmpeg.avcodec_send_frame(_codecCtx, _hwFrame);
-            ffmpeg.av_frame_unref(_hwFrame);
+            ret = ffmpeg.avcodec_send_frame(_codecCtx, frameToEncode);
+            ffmpeg.av_frame_unref(frameToEncode);
             if (ret < 0) { ResoniteMod.Msg($"[FfmpegEnc:{_streamId}] avcodec_send_frame failed: {FfmpegError(ret)}"); return; }
         }
 

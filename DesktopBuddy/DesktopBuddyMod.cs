@@ -908,7 +908,7 @@ public class DesktopBuddyMod : ResoniteMod
                 var volOverride = videoSlot.AttachComponent<ValueUserOverride<float>>();
                 volOverride.Target.Target = audioOutput.Volume;
                 volOverride.Default.Value = 1f; // Other users: full volume
-                volOverride.CreateOverrideOnWrite.Value = false;
+                volOverride.CreateOverrideOnWrite.Value = true;
                 volOverride.SetOverride(root.World.LocalUser, 0f); // Spawner: muted
                 volOverrideRef = volOverride;
 
